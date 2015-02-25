@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"os"
 	"strings"
 
 	"go/format"
@@ -29,6 +30,7 @@ type Table struct {
 	name        string
 	columns     []*Column // The columns in this table
 	columnNames []string
+	relations   []*Relation
 }
 
 // Column represents a SQL column
@@ -41,6 +43,13 @@ type Column struct {
 	extra    string
 }
 
+// Relation represents a foreign key constraint on a table
+type Relation struct {
+	columnName       string
+	referencedTable  string
+	referencedColumn string
+}
+
 // Generator generates the file
 type Generator struct {
 	buf bytes.Buffer
@@ -49,6 +58,11 @@ type Generator struct {
 func main() {
 	log.SetPrefix("ps-generator: ")
 	flag.Parse()
+
+	if *database == "" || *username == "" {
+		flag.Usage()
+		os.Exit(2)
+	}
 
 	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@%s/%s", *username, *password, *host, *database))
 	defer db.Close()
@@ -122,6 +136,27 @@ func generateTableMetadata(db *sql.DB) []*Table {
 		}
 
 		rows.Close()
+
+		rows, err = db.Query(fmt.Sprintf(`select COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+			from INFORMATION_SCHEMA.KEY_COLUMN_USAGE where TABLE_NAME = '%s'
+			and REFERENCED_TABLE_NAME is not null;`, table.name))
+
+		if err != nil {
+			log.Panicf("Failed to describe table!\n\t%s", err)
+		}
+
+		for rows.Next() {
+			relation := new(Relation)
+			err := rows.Scan(&relation.columnName, &relation.referencedTable, &relation.referencedColumn)
+
+			if err != nil {
+				log.Panicf("Failed to describe table!\n\t%s", err)
+			}
+
+			table.relations = append(table.relations, relation)
+		}
+
+		rows.Close()
 	}
 
 	return tables
@@ -158,6 +193,8 @@ func (g *Generator) processTable(table *Table) {
 	g.printf("%s_Insert = `%s`\n", table.name, g.insert(table))
 	g.printf("%s_Update = `%s`\n", table.name, g.update(table))
 	g.printf("%s_Delete = `%s`\n", table.name, g.delete(table))
+
+	g.relations(table)
 
 	g.printf(")\n\n")
 }
@@ -217,6 +254,13 @@ func (g *Generator) delete(table *Table) string {
 	}
 
 	return fmt.Sprintf("delete from %s where %s = ?", table.name, idColumn)
+}
+
+func (g *Generator) relations(table *Table) {
+	for _, relation := range table.relations {
+		sql := fmt.Sprintf("select %s from %s where %s = ?", strings.Join(table.columnNames, ", "), table.name, relation.columnName)
+		g.printf("%s_%s_%s = `%s`\n", table.name, relation.referencedTable, relation.columnName, sql)
+	}
 }
 
 func (g *Generator) printf(format string, args ...interface{}) {
